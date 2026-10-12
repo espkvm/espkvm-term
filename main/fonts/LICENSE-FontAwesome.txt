@@ -1,0 +1,7 @@
+The symbols in font_ui_20.c, font_ui_26.c and font_bold_34.c come from
+Font Awesome Free 5 (https://fontawesome.com), as bundled with LVGL
+(FontAwesome5-Solid+Brands+Regular.woff).
+
+Font Awesome Free: the fonts are licensed under the SIL Open Font License 1.1
+(https://scripts.sil.org/OFL), the icons under CC BY 4.0
+(https://creativecommons.org/licenses/by/4.0/).

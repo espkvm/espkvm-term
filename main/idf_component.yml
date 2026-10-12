@@ -1,0 +1,16 @@
+dependencies:
+  idf: ">=6.1"
+  espressif/m5stack_tab5: "~1.3"
+  # Wi-Fi through the Tab5's ESP32-C6 (same versions as the firmware).
+  espressif/esp_wifi_remote: "*"
+  espressif/esp_hosted: "~3.0.9"
+  espressif/esp_websocket_client: "^1.4"
+  # "espkvm.local": lwIP's own .local lookup gets no answer through the C6.
+  espressif/mdns: "^1.8.0"
+  # Text mode readings are JSON; cJSON left the IDF core in v6.0.
+  espressif/cjson: "^1.7.0"
+  # The wire protocol, from the firmware repository: the device defines it, so
+  # it lives there. For now a checkout of espkvm next to this one; once it is
+  # pushed: git: https://github.com/espkvm/espkvm.git, path: components/kvm_proto.
+  kvm_proto:
+    path: "../../espkvm/components/kvm_proto"

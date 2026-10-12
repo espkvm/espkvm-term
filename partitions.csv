@@ -1,0 +1,4 @@
+# Name,   Type, SubType, Offset,   Size
+# nvs at 0x9000 like the stock tables, so a launcher's NVS stays where it expects.
+nvs,      data, nvs,     0x9000,   0x6000,
+factory,  app,  factory, 0x10000,  0x400000,

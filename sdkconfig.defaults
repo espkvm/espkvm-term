@@ -1,0 +1,65 @@
+CONFIG_IDF_TARGET="esp32p4"
+# The Tab5's chip is an ESP32-P4NRW32: revision 1.x.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+CONFIG_FREERTOS_HZ=1000
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_MONTSERRAT_22=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_22=y
+
+# Wi-Fi: the C6 over SDIO, with esp-hosted's Tab5 pins (CLK 12, CMD 13,
+# D0-D3 11/10/9/8, reset 15). The C6 is powered from main.c's net task first,
+# so esp-hosted must not start it before app_main.
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP32P4_TAB5_C6_BOARD=y
+CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# LVGL allocates from the system heap (PSRAM for big buffers), not a 64 KB pool.
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+# Screenshots for the debug link.
+CONFIG_LV_USE_SNAPSHOT=y
+
+# Device link: TLS buffers in PSRAM; the CA is fetched once unchecked (shown
+# to the user to trust), every other connection checks it.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
+
+# TCP: the default 5.7 KB window held the picture to ~300 KB/s through the C6.
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=48
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_CORE_LOCKING=y
+
+# Screen rotation by the PPA, not the CPU: the full-screen picture redraws every frame.
+CONFIG_LVGL_PORT_ENABLE_PPA=y
+
+# Tailscale (microlink): its Noise layer uses ChaCha20-Poly1305 through PSA.
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+# Its WireGuard netif keeps its own data in netif->state; this moves esp_netif's
+# handle out of the way (else esp_netif's lwIP callback crashes on the tunnel).
+CONFIG_ESP_NETIF_BRIDGE_EN=y
+# Two panel buffers: the picture is put together in the hidden one, then shown
+CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
+# Copy each received packet into lwIP's own buffer (PSRAM) and hand the
+# esp-hosted SDIO buffer (internal DMA RAM) straight back: with a 64 KB TCP
+# window the held buffers ran internal RAM out and the picture socket died.
+CONFIG_LWIP_L2_TO_L3_COPY=y
