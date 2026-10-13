@@ -43,7 +43,7 @@ jobs:
           # git inside the container refuses a checkout owned by another user,
           # and merge-bin needs the esptool that ships with this IDF.
           command: >-
-            git config --global --add safe.directory '*' &&
+            git config --global --add safe.directory "$PWD" &&
             idf.py build &&
             idf.py merge-bin -o espkvm-term-merged.bin
 
