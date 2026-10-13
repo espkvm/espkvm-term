@@ -12,15 +12,23 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
+#include <errno.h>
+#include "lwip/sockets.h"
 
 #include "bsp/esp-bsp.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "kvm_link.h"
+#include "orient.h"
+#include "power.h"
 #include "video.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 static const char *TAG = "dbg";
@@ -33,8 +41,13 @@ static void ptr_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     /* LVGL turns pointer input with the display (90 degrees: X = 1279 - y,
      * Y = x), so hand it the panel's own coordinates. */
-    data->point.x = s_tap_y;
-    data->point.y = 1279 - s_tap_x;
+    if (video_flipped()) {
+        data->point.x = 719 - s_tap_y;
+        data->point.y = s_tap_x;
+    } else {
+        data->point.x = s_tap_y;
+        data->point.y = 1279 - s_tap_x;
+    }
     if (s_tap_frames > 0) {
         s_tap_frames--;
         data->state = LV_INDEV_STATE_PRESSED;
@@ -69,7 +82,9 @@ static void shot_panel(const uint16_t *fb, int div)
     out(hdr, n);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            row[x] = fb[(size_t)(1279 - x * div) * 720 + y * div]; /* screen (x, y) = panel (y, 1279 - x) */
+            /* screen (x, y) = panel (y, 1279 - x), or (719 - y, x) upside down */
+            row[x] = video_flipped() ? fb[(size_t)(x * div) * 720 + 719 - y * div]
+                                     : fb[(size_t)(1279 - x * div) * 720 + y * div];
         }
         out(row, w * 2);
     }
@@ -123,6 +138,41 @@ static void shot(int div)
     }
 }
 
+/* Moves the target's pointer round a small circle for ten seconds: no
+ * clicks, just a screen that keeps changing (for measuring the frame rate). */
+static void wiggle_task(void *arg)
+{
+    for (int i = 0; i < 300; i++) {
+        float a = i * 0.2f;
+        uint8_t msg[8];
+        size_t n = kvm_msg_mouse_abs(msg, 0, (uint16_t)(KVM_ABS_MAX * (0.5f + 0.05f * cosf(a))),
+                                     (uint16_t)(KVM_ABS_MAX * (0.5f + 0.08f * sinf(a))), 0, 0);
+        link_send(msg, n);
+        vTaskDelay(pdMS_TO_TICKS(33));
+    }
+    vTaskDelete(NULL);
+}
+
+/* "tcp 192.168.1.10 443": can a connection be opened at all */
+static void tcp_probe(const char *arg)
+{
+    char ip[40];
+    int port;
+    if (sscanf(arg, "%39s %d", ip, &port) != 2) {
+        return;
+    }
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
+    inet_pton(AF_INET, ip, &a.sin_addr);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = {.tv_sec = 3};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int64_t t0 = esp_timer_get_time();
+    int r = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    ESP_LOGI(TAG, "tcp %s:%d: %s (errno %d) in %lld ms", ip, port, r == 0 ? "connected" : "failed", r ? errno : 0,
+             (long long)((esp_timer_get_time() - t0) / 1000));
+    close(fd);
+}
+
 static void handle(char *line)
 {
     int x, y;
@@ -130,6 +180,9 @@ static void handle(char *line)
     if (!strncmp(line, "shot", 4)) {
         shot(line[4] == ' ' && line[5] == '1' ? 1 : 2);
     } else if (sscanf(line, "tap %d %d", &x, &y) == 2) {
+        if (power_activity()) {
+            return; /* it woke the screen, like a finger would */
+        }
         s_tap_x = x;
         s_tap_y = y;
         s_tap_frames = 3;
@@ -139,6 +192,33 @@ static void handle(char *line)
         for (const char *c = line + 4; *c; c++) {
             s_key((uint8_t)*c);
         }
+    } else if (!strncmp(line, "zoom ", 5)) {
+        float z = 1, cx = 0, cy = 0;
+        sscanf(line + 5, "%f %f %f", &z, &cx, &cy);
+        video_set_zoom(z, cx, cy);
+    } else if (!strcmp(line, "wiggle")) {
+        xTaskCreate(wiggle_task, "wiggle", 3072, NULL, 3, NULL);
+    } else if (!strcmp(line, "power")) {
+        power_state_t ps;
+        power_get(&ps);
+        ESP_LOGI(TAG, "battery %s, %.2f V, %d%%%s", ps.present ? "in" : "not found", ps.volts, ps.percent,
+                 ps.charging ? ", charging" : "");
+        float ax, ay, az;
+        if (orient_accel(&ax, &ay, &az)) {
+            ESP_LOGI(TAG, "accel x %+.2f y %+.2f z %+.2f g, %s", ax, ay, az,
+                     video_flipped() ? "upside down" : "upright");
+        }
+    } else if (!strcmp(line, "link")) {
+        link_debug();
+    } else if (!strcmp(line, "stats")) {
+        video_stats_t vs;
+        video_get_stats(&vs);
+        float z, cx, cy;
+        video_get_zoom(&z, &cx, &cy);
+        ESP_LOGI(TAG, "video %dx%d at %d,%d %dx%d, %.1f fps (%.1f in), last %lld ms ago, decode %d ms, zoom %.2f at %.0f,%.0f%s%s",
+                 vs.src_w, vs.src_h, vs.x, vs.y, vs.w, vs.h, vs.fps, vs.in_fps,
+                 (long long)((esp_timer_get_time() - vs.shown_at) / 1000), vs.decode_ms, z, cx, cy,
+                 vs.problem ? ", " : "", vs.problem ? vs.problem : "");
     } else if (!strcmp(line, "heap")) {
         ESP_LOGI(TAG, "internal free %u largest %u min %u, dma free %u largest %u, psram free %u",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -147,6 +227,8 @@ static void handle(char *line)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    } else if (!strncmp(line, "tcp ", 4)) {
+        tcp_probe(line + 4);
     } else if (line[0]) {
         ESP_LOGW(TAG, "unknown: %s", line);
     }
@@ -186,5 +268,5 @@ void debug_link_start(void (*inject_key)(uint32_t key))
     lv_indev_set_read_cb(s_ptr, ptr_read);
     bsp_display_unlock();
     /* The snapshot renders the screen on this stack. */
-    xTaskCreate(link_task, "dbg", 16384, NULL, 3, NULL);
+    xTaskCreateWithCaps(link_task, "dbg", 16384, NULL, 3, NULL, MALLOC_CAP_SPIRAM); /* no flash access */
 }

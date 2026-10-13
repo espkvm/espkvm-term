@@ -43,6 +43,9 @@ void ui_show(ui_screen_t s)
     case UI_TS:
         ui_ts_build();
         break;
+    case UI_UPDATE:
+        ui_update_build();
+        break;
     }
 }
 

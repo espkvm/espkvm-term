@@ -9,6 +9,8 @@ dependencies:
   espressif/mdns: "^1.8.0"
   # Text mode readings are JSON; cJSON left the IDF core in v6.0.
   espressif/cjson: "^1.7.0"
+  # A USB keyboard and mouse in the Tab5's USB-A port.
+  espressif/usb_host_hid: "^1.0"
   # The wire protocol, from the firmware repository: the device defines it, so
   # it lives there. For now a checkout of espkvm next to this one; once it is
   # pushed: git: https://github.com/espkvm/espkvm.git, path: components/kvm_proto.

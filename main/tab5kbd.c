@@ -10,7 +10,9 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 static const char *TAG = "kbd";
@@ -247,5 +249,5 @@ void kbd_start(kbd_event_cb_t on_event, kbd_presence_cb_t on_presence)
     };
     gpio_config(&io);
 
-    xTaskCreate(kbd_task, "kbd", 3072, bus, 5, NULL);
+    xTaskCreateWithCaps(kbd_task, "kbd", 3072, bus, 5, NULL, MALLOC_CAP_SPIRAM); /* no flash access */
 }

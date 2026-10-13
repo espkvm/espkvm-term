@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "src/display/lv_display_private.h"
@@ -32,8 +33,32 @@ static const char *TAG = "video";
 
 static jpeg_decoder_handle_t s_dec;
 static ppa_client_handle_t s_ppa;
-static uint8_t *s_dec_out;
 static size_t s_in_cap, s_dec_cap;
+
+/* Two decoded frames: the decoder fills one while the other is drawn, so a
+ * decode and a draw run at the same time. s_shown is the one the screen was
+ * last drawn from (the decoder keeps off it), s_ready one decoded and not
+ * drawn yet, -1 = none. */
+typedef struct {
+    int pw, ph, w, h; /* padded and real size */
+} frame_t;
+static uint8_t *s_dec_buf[2];
+static frame_t s_frm[2];
+static int s_shown = -1, s_ready = -1;
+static SemaphoreHandle_t s_frm_mu;
+static TaskHandle_t s_draw_task;
+static void draw_task(void *arg);
+
+/* What part of the frame is on screen, and where: zoom 1 = all of it. */
+typedef struct {
+    int sx, sy, sw, sh; /* in the frame */
+    int ox, oy, ow, oh; /* on the 1280x720 screen */
+    float sc;
+} view_t;
+static float s_zoom = 1, s_zcx, s_zcy; /* draw lock */
+/* The Tab5 upside down: the UI turned 270 degrees on the panel instead of 90 */
+static volatile bool s_flip;
+static view_t s_view;                  /* the last one drawn */
 
 /* Two input buffers: the network fills one while the decoder works on the
  * other, so receiving never waits for a decode. A newer frame replaces one
@@ -67,7 +92,7 @@ typedef struct {
     uint32_t *px;   /* ARGB8888, w x h */
     size_t cap;
 } overlay_t;
-#define OVL_MAX 6
+#define OVL_MAX 8
 static overlay_t s_ovl[OVL_MAX];
 static int s_ovl_n;
 
@@ -76,12 +101,7 @@ static bool s_own;                    /* LVGL is kept off the panel */
 static bool s_ui_dirty;               /* LVGL drew something meanwhile... */
 static lv_area_t s_ui_dirty_at;       /* ...there (screen coordinates) */
 static lv_display_flush_cb_t s_lv_flush;
-static volatile bool s_redraw;        /* lay the overlays again over the last frame */
-static struct {
-    int pw, ph, w, h, ox, oy;
-    float sc;
-    bool ok;
-} s_last;
+static volatile bool s_redraw;        /* draw the last frame again (overlays, zoom) */
 /* Held while a frame is written, so detaching waits for it. */
 static SemaphoreHandle_t s_draw_mu;
 
@@ -97,7 +117,7 @@ static int s_fps_n;
 static int s_in_n;
 static size_t s_in_bytes;
 static int64_t s_dec_us, s_scale_us, s_srm_us, s_blend_us, s_wait_us;
-static int s_clears;
+static int s_clears, s_dec_n;
 
 /*
  * The panel handle is not handed out by the BSP; esp_lvgl_port keeps it in
@@ -137,10 +157,11 @@ static bool setup(void)
     jpeg_decode_memory_alloc_cfg_t out_cfg = {.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER};
     s_in[0] = jpeg_alloc_decoder_mem(IN_MAX, &in_cfg, &s_in_cap);
     s_in[1] = jpeg_alloc_decoder_mem(IN_MAX, &in_cfg, &s_in_cap);
-    s_dec_out = jpeg_alloc_decoder_mem(DEC_MAX, &out_cfg, &s_dec_cap);
+    s_dec_buf[0] = jpeg_alloc_decoder_mem(DEC_MAX, &out_cfg, &s_dec_cap);
+    s_dec_buf[1] = jpeg_alloc_decoder_mem(DEC_MAX, &out_cfg, &s_dec_cap);
     ppa_client_config_t pcfg = {.oper_type = PPA_OPERATION_SRM};
     ppa_client_config_t bcfg = {.oper_type = PPA_OPERATION_BLEND};
-    if (!s_in[0] || !s_in[1] || !s_dec_out || ppa_register_client(&pcfg, &s_ppa) != ESP_OK ||
+    if (!s_in[0] || !s_in[1] || !s_dec_buf[0] || !s_dec_buf[1] || ppa_register_client(&pcfg, &s_ppa) != ESP_OK ||
         ppa_register_client(&bcfg, &s_blend) != ESP_OK) {
         return false;
     }
@@ -156,7 +177,11 @@ static bool setup(void)
         lv_draw_buf_init(&s_dbuf[i], SCR_W, SCR_H, LV_COLOR_FORMAT_RGB565, SCR_W * 2, s_fb[i], fb_size);
     }
     s_in_mu = xSemaphoreCreateMutex();
-    return s_in_mu && xTaskCreate(decode_task, "video", 4096, NULL, 5, &s_task) == pdPASS;
+    s_frm_mu = xSemaphoreCreateMutex();
+    return s_in_mu && s_frm_mu &&
+           /* Stacks in PSRAM: neither task touches the flash */
+           xTaskCreateWithCaps(draw_task, "draw", 4096, NULL, 5, &s_draw_task, MALLOC_CAP_SPIRAM) == pdPASS &&
+           xTaskCreateWithCaps(decode_task, "video", 4096, NULL, 5, &s_task, MALLOC_CAP_SPIRAM) == pdPASS;
 }
 
 lv_obj_t *video_create(lv_obj_t *parent)
@@ -189,7 +214,13 @@ void video_detach(void)
     }
     s_img = NULL;
     s_stats.w = s_stats.h = 0;
-    s_last.ok = false;
+    if (s_frm_mu) {
+        xSemaphoreTake(s_frm_mu, portMAX_DELAY);
+        s_shown = s_ready = -1;
+        xSemaphoreGive(s_frm_mu);
+    }
+    s_zoom = 1;
+    s_view = (view_t){0};
     if (s_draw_mu) {
         xSemaphoreGive(s_draw_mu);
     }
@@ -220,8 +251,8 @@ void video_own_panel(bool on)
         lv_display_set_flush_cb(d, flush_owned);
         s_gen++;
         s_redraw = true;
-        if (s_task) {
-            xTaskNotifyGive(s_task);
+        if (s_draw_task) {
+            xTaskNotifyGive(s_draw_task);
         }
     } else {
         xSemaphoreTake(s_draw_mu, portMAX_DELAY); /* no frame half-way into the panel */
@@ -278,8 +309,8 @@ void video_set_overlays(lv_draw_buf_t *const *img, const lv_area_t *at, const bo
                 continue;
             }
         }
-        /* Screen (x, y) is panel (y, SCR_W - 1 - x) */
-        int px = y1, py = SCR_W - 1 - x2;
+        /* Screen (x, y) is panel (y, SCR_W - 1 - x), or (SCR_H - 1 - y, x) flipped */
+        int px = s_flip ? SCR_H - 1 - y2 : y1, py = s_flip ? x1 : SCR_W - 1 - x2;
         bool same = k < s_ovl_n && o->x == px && o->y == py && o->w == w && o->h == h;
         moved |= !same;
         if (same && !fresh[i]) {
@@ -298,10 +329,18 @@ void video_set_overlays(lv_draw_buf_t *const *img, const lv_area_t *at, const bo
                 int ey = LV_MIN(ty + 15, y2), ex = LV_MIN(tx + 15, x2);
                 for (int y = ty; y <= ey; y++) {
                     const uint32_t *row = src + (size_t)(y - sy0) * stride - sx0;
-                    uint32_t *dst = o->px + (size_t)(x2 - tx) * w + (y - y1);
-                    for (int x = tx; x <= ex; x++) {
-                        *dst = row[x];
-                        dst -= w;
+                    if (s_flip) {
+                        uint32_t *dst = o->px + (size_t)(tx - x1) * w + (y2 - y);
+                        for (int x = tx; x <= ex; x++) {
+                            *dst = row[x];
+                            dst += w;
+                        }
+                    } else {
+                        uint32_t *dst = o->px + (size_t)(x2 - tx) * w + (y - y1);
+                        for (int x = tx; x <= ex; x++) {
+                            *dst = row[x];
+                            dst -= w;
+                        }
                     }
                 }
             }
@@ -312,13 +351,13 @@ void video_set_overlays(lv_draw_buf_t *const *img, const lv_area_t *at, const bo
     s_ovl_n = k;
     /* Old overlays may lie over black borders; a picture over the whole
      * screen hides them anyway. */
-    if (moved && !(s_last.ok && s_stats.w == SCR_W && s_stats.h == SCR_H)) {
+    if (moved && !(s_shown >= 0 && s_stats.w == SCR_W && s_stats.h == SCR_H)) {
         s_gen++;
     }
     s_redraw = true;
     xSemaphoreGive(s_draw_mu);
-    if (s_task) {
-        xTaskNotifyGive(s_task);
+    if (s_draw_task) {
+        xTaskNotifyGive(s_draw_task);
     }
 }
 
@@ -334,20 +373,51 @@ static float fit_scale(int w, int h)
     return floorf(s * 16) / 16;
 }
 
-/* The last frame into the hidden panel buffer, scaled and turned in one pass.
- * The UI's (x, y) is the panel's (y, SCR_W - 1 - x), as esp_lvgl_port turns it. */
-static esp_err_t draw_frame(void)
+static int clampi(int v, int lo, int hi)
 {
-    int ow = (int)(s_last.w * s_last.sc);
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+/* Which part of the frame shows, at the zoom asked for. Draw lock held. */
+static view_t view_of(const frame_t *f)
+{
+    view_t v;
+    float base = fit_scale(f->w, f->h);
+    v.sc = floorf(base * s_zoom * 16) / 16;
+    v.sc = v.sc < base ? base : v.sc > 8 ? 8 : v.sc;
+    v.sw = LV_MIN(f->w, (int)(SCR_W / v.sc));
+    v.sh = LV_MIN(f->h, (int)(SCR_H / v.sc));
+    if (s_zoom <= 1) {
+        s_zcx = f->w / 2.0f;
+        s_zcy = f->h / 2.0f;
+    }
+    v.sx = clampi((int)(s_zcx - v.sw / 2.0f), 0, f->w - v.sw);
+    v.sy = clampi((int)(s_zcy - v.sh / 2.0f), 0, f->h - v.sh);
+    /* the centre as it ended up, so a pan past the edge does not pile up */
+    s_zcx = v.sx + v.sw / 2.0f;
+    s_zcy = v.sy + v.sh / 2.0f;
+    v.ow = (int)(v.sw * v.sc);
+    v.oh = (int)(v.sh * v.sc);
+    v.ox = (SCR_W - v.ow) / 2;
+    v.oy = (SCR_H - v.oh) / 2;
+    return v;
+}
+
+/* A frame into the hidden panel buffer, scaled and turned in one pass.
+ * The UI's (x, y) is the panel's (y, SCR_W - 1 - x), as esp_lvgl_port turns it. */
+static esp_err_t draw_frame(const uint8_t *buf, const frame_t *f, const view_t *v)
+{
     ppa_srm_oper_config_t op = {
-        .in = {.buffer = s_dec_out, .pic_w = s_last.pw, .pic_h = s_last.ph, .block_w = s_last.w,
-               .block_h = s_last.h, .srm_cm = PPA_SRM_COLOR_MODE_RGB565},
+        .in = {.buffer = buf, .pic_w = f->pw, .pic_h = f->ph, .block_w = v->sw, .block_h = v->sh,
+               .block_offset_x = v->sx, .block_offset_y = v->sy, .srm_cm = PPA_SRM_COLOR_MODE_RGB565},
         .out = {.buffer = s_panel, .buffer_size = PANEL_W * PANEL_H * 2, .pic_w = PANEL_W,
-                .pic_h = PANEL_H, .block_offset_x = s_last.oy, .block_offset_y = SCR_W - s_last.ox - ow,
+                .pic_h = PANEL_H,
+                .block_offset_x = s_flip ? PANEL_W - v->oy - v->oh : v->oy,
+                .block_offset_y = s_flip ? v->ox : SCR_W - v->ox - v->ow,
                 .srm_cm = PPA_SRM_COLOR_MODE_RGB565},
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_90,
-        .scale_x = s_last.sc,
-        .scale_y = s_last.sc,
+        .rotation_angle = s_flip ? PPA_SRM_ROTATION_ANGLE_270 : PPA_SRM_ROTATION_ANGLE_90,
+        .scale_x = v->sc,
+        .scale_y = v->sc,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
     return ppa_do_scale_rotate_mirror(s_ppa, &op);
@@ -378,19 +448,26 @@ static esp_err_t draw_overlays(void)
 }
 
 /* The screen put together in the hidden buffer: black where needed, the
- * last frame, the overlays; then shown from the next refresh on, so nothing
- * half-drawn is ever seen. Draw lock held. */
-static esp_err_t compose(void)
+ * frame, the overlays; then shown from the next refresh on, so nothing
+ * half-drawn is ever seen. Draw lock held; buf NULL = no frame yet. */
+static esp_err_t compose(const uint8_t *buf, const frame_t *f)
 {
     int back = s_front ^ 1;
     s_panel = s_pfb[back];
+    view_t v = {0};
+    if (buf) {
+        v = view_of(f);
+        if (v.ox != s_view.ox || v.oy != s_view.oy || v.ow != s_view.ow || v.oh != s_view.oh) {
+            s_gen++; /* the picture's edges moved: clear the borders */
+        }
+    }
     /* The buffer just hidden may still be read out by the last refresh */
-    int64_t wait = s_flip_us + 20000 - esp_timer_get_time();
+    int64_t wait = s_flip_us + 17000 - esp_timer_get_time();
     if (wait > 0) {
         s_wait_us += wait;
-        vTaskDelay(pdMS_TO_TICKS(wait / 1000) + 1);
+        vTaskDelay(pdMS_TO_TICKS((wait + 999) / 1000));
     }
-    if (s_fb_gen[back] != s_gen || !s_last.ok) {
+    if (s_fb_gen[back] != s_gen || !buf) {
         s_clears++;
         memset(s_panel, 0, PANEL_W * PANEL_H * 2);
         esp_cache_msync(s_panel, PANEL_W * PANEL_H * 2, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
@@ -398,8 +475,8 @@ static esp_err_t compose(void)
     }
     esp_err_t err = ESP_OK;
     int64_t t0 = esp_timer_get_time();
-    if (s_last.ok) {
-        err = draw_frame();
+    if (buf) {
+        err = draw_frame(buf, f, &v);
     }
     int64_t t1 = esp_timer_get_time();
     if (err == ESP_OK) {
@@ -411,21 +488,45 @@ static esp_err_t compose(void)
         esp_lcd_panel_draw_bitmap(s_panel_h, 0, 0, PANEL_W, PANEL_H, s_panel);
         s_front = back;
         s_flip_us = esp_timer_get_time();
+        if (buf) {
+            s_view = v;
+        }
     }
     return err;
 }
 
-/* The overlays changed: the last frame (or black) under the new ones. */
-static void redraw(void)
+/* Without the panel's own buffers: into an LVGL image, unturned. */
+static esp_err_t compose_lvgl(const uint8_t *buf, const frame_t *f)
 {
-    xSemaphoreTake(s_draw_mu, portMAX_DELAY);
-    if (s_own && !s_paused) {
-        esp_err_t err = compose();
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "redraw: %s", esp_err_to_name(err));
-        }
+    view_t v = view_of(f);
+    uint16_t *fb = s_fb[s_back];
+    if (v.ox != s_view.ox || v.oy != s_view.oy || v.ow != s_view.ow || v.oh != s_view.oh) {
+        memset(s_fb[0], 0, SCR_W * SCR_H * 2); /* the edges moved: clear the borders */
+        memset(s_fb[1], 0, SCR_W * SCR_H * 2);
     }
-    xSemaphoreGive(s_draw_mu);
+    ppa_srm_oper_config_t op = {
+        .in = {.buffer = buf, .pic_w = f->pw, .pic_h = f->ph, .block_w = v.sw, .block_h = v.sh,
+               .block_offset_x = v.sx, .block_offset_y = v.sy, .srm_cm = PPA_SRM_COLOR_MODE_RGB565},
+        .out = {.buffer = fb, .buffer_size = SCR_W * SCR_H * 2, .pic_w = SCR_W, .pic_h = SCR_H,
+                .block_offset_x = v.ox, .block_offset_y = v.oy, .srm_cm = PPA_SRM_COLOR_MODE_RGB565},
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x = v.sc,
+        .scale_y = v.sc,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa, &op);
+    if (err != ESP_OK) {
+        return err;
+    }
+    s_view = v;
+    bsp_display_lock(0);
+    if (s_img) {
+        lv_image_set_src(s_img, &s_dbuf[s_back]);
+        lv_obj_invalidate(s_img);
+    }
+    bsp_display_unlock();
+    s_back ^= 1;
+    return ESP_OK;
 }
 
 void video_frame(const kvm_video_hdr_t *hdr, const uint8_t *data, size_t len)
@@ -463,16 +564,13 @@ static void decode_task(void *arg)
             s_work ^= 1;
         }
         xSemaphoreGive(s_in_mu);
-        bool again = s_redraw;
-        s_redraw = false;
         if (len && s_img && !s_paused) {
             decode_one(s_in[s_work], len);
-        } else if (again && s_panel) {
-            redraw();
         }
     }
 }
 
+/* Into the buffer the screen is not drawn from, then handed to the draw task. */
 static void decode_one(const uint8_t *in, size_t len)
 {
     int64_t t0 = esp_timer_get_time();
@@ -480,93 +578,46 @@ static void decode_one(const uint8_t *in, size_t len)
     if (jpeg_decoder_get_info(in, len, &info) != ESP_OK) {
         return;
     }
+    xSemaphoreTake(s_frm_mu, portMAX_DELAY);
+    int target = s_shown == 0 ? 1 : 0;
+    if (s_ready == target) {
+        s_ready = -1; /* not drawn in time: this frame replaces it */
+    }
+    xSemaphoreGive(s_frm_mu);
     jpeg_decode_cfg_t dcfg = {
         .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
         .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
         .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
     };
     uint32_t out_size = 0;
-    esp_err_t err = jpeg_decoder_process(s_dec, &dcfg, in, len, s_dec_out, s_dec_cap, &out_size);
+    esp_err_t err = jpeg_decoder_process(s_dec, &dcfg, in, len, s_dec_buf[target], s_dec_cap, &out_size);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "decode %ux%u, %u bytes: %s", (unsigned)info.width, (unsigned)info.height,
                  (unsigned)len, esp_err_to_name(err));
         s_stats.problem = "JPEG decode failed";
         return;
     }
-    int64_t td = esp_timer_get_time();
+    s_dec_us += esp_timer_get_time() - t0;
+    s_dec_n++;
+    xSemaphoreTake(s_frm_mu, portMAX_DELAY);
     /* The decoder pads to whole 16-pixel blocks. */
-    int pw = (info.width + 15) & ~15, ph = (info.height + 15) & ~15;
-    float sc = fit_scale(info.width, info.height);
-    int ow = (int)(info.width * sc), oh = (int)(info.height * sc);
-    int ox = (SCR_W - ow) / 2, oy = (SCR_H - oh) / 2;
+    s_frm[target] = (frame_t){(info.width + 15) & ~15, (info.height + 15) & ~15, info.width, info.height};
+    s_ready = target;
+    xSemaphoreGive(s_frm_mu);
+    xTaskNotifyGive(s_draw_task);
+}
 
-    bool fresh = ow != s_stats.w || oh != s_stats.h;
-    int64_t ts;
-    if (s_panel) {
-        /* Scaled and turned in one pass, into the hidden panel buffer */
-        xSemaphoreTake(s_draw_mu, portMAX_DELAY);
-        if (!s_img || s_paused || !s_own) {
-            xSemaphoreGive(s_draw_mu);
-            return;
-        }
-        if (fresh) {
-            s_gen++; /* new size: clear the borders */
-        }
-        s_last = (typeof(s_last)){pw, ph, info.width, info.height, ox, oy, sc, true};
-        esp_err_t err = compose();
-        xSemaphoreGive(s_draw_mu);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "PPA: %s", esp_err_to_name(err));
-            s_stats.problem = "scaling failed";
-            return;
-        }
-        ts = esp_timer_get_time();
-    } else {
-        uint16_t *fb = s_fb[s_back];
-        if (fresh) {
-            memset(fb, 0, SCR_W * SCR_H * 2); /* new size: clear the borders */
-            memset(s_fb[s_back ^ 1], 0, SCR_W * SCR_H * 2);
-        }
-        ppa_srm_oper_config_t op = {
-            .in = {.buffer = s_dec_out, .pic_w = pw, .pic_h = ph, .block_w = info.width,
-                   .block_h = info.height, .srm_cm = PPA_SRM_COLOR_MODE_RGB565},
-            .out = {.buffer = fb, .buffer_size = SCR_W * SCR_H * 2, .pic_w = SCR_W, .pic_h = SCR_H,
-                    .block_offset_x = ox, .block_offset_y = oy, .srm_cm = PPA_SRM_COLOR_MODE_RGB565},
-            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-            .scale_x = sc,
-            .scale_y = sc,
-            .mode = PPA_TRANS_MODE_BLOCKING,
-        };
-        if (ppa_do_scale_rotate_mirror(s_ppa, &op) != ESP_OK) {
-            s_stats.problem = "scaling failed";
-            return;
-        }
-        ts = esp_timer_get_time();
-        bsp_display_lock(0);
-        if (s_img) {
-            lv_image_set_src(s_img, &s_dbuf[s_back]);
-            lv_obj_invalidate(s_img);
-        }
-        bsp_display_unlock();
-        s_back ^= 1;
-    }
-
+static void count_frame(void)
+{
     int64_t t1 = esp_timer_get_time();
-    s_stats.problem = NULL;
-    s_stats.src_w = info.width;
-    s_stats.src_h = info.height;
-    s_stats.x = ox;
-    s_stats.y = oy;
-    s_stats.w = ow;
-    s_stats.h = oh;
-    s_stats.decode_ms = (int)((t1 - t0) / 1000);
+    s_stats.shown_at = t1;
     s_fps_n++;
-    s_dec_us += td - t0;
-    s_scale_us += ts - td;
     if (t1 - s_fps_t0 >= 1000000) {
         s_stats.fps = s_fps_n * 1e6f / (t1 - s_fps_t0);
+        s_stats.in_fps = s_in_n * 1e6f / (t1 - s_fps_t0);
+        s_stats.decode_ms = s_dec_n ? (int)(s_dec_us / 1000 / s_dec_n) : 0;
         ESP_LOGD(TAG, "in %d frames %u KB, shown %d, decode %d ms, compose %d ms (scale %d, overlays %d, wait %d, clears %d)",
-                 s_in_n, (unsigned)(s_in_bytes / 1024), s_fps_n, (int)(s_dec_us / 1000 / s_fps_n),
+                 s_in_n, (unsigned)(s_in_bytes / 1024), s_fps_n, s_stats.decode_ms,
                  (int)(s_scale_us / 1000 / s_fps_n), (int)(s_srm_us / 1000 / s_fps_n),
                  (int)(s_blend_us / 1000 / s_fps_n), (int)(s_wait_us / 1000 / s_fps_n), s_clears);
         s_srm_us = s_blend_us = s_wait_us = 0;
@@ -574,9 +625,123 @@ static void decode_one(const uint8_t *in, size_t len)
         s_in_n = 0;
         s_in_bytes = 0;
         s_dec_us = s_scale_us = 0;
+        s_dec_n = 0;
         s_fps_t0 = t1;
         s_fps_n = 0;
     }
+}
+
+/* Draws the newest decoded frame, or the last one again when the overlays or
+ * the zoom changed. Runs while the next frame decodes. */
+static void draw_task(void *arg)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        xSemaphoreTake(s_frm_mu, portMAX_DELAY);
+        bool fresh = s_ready >= 0;
+        if (fresh) {
+            s_shown = s_ready;
+            s_ready = -1;
+        }
+        int idx = s_shown;
+        frame_t f = idx >= 0 ? s_frm[idx] : (frame_t){0};
+        xSemaphoreGive(s_frm_mu);
+        bool again = s_redraw;
+        s_redraw = false;
+        if (!fresh && !again) {
+            continue;
+        }
+        int64_t t0 = esp_timer_get_time();
+        esp_err_t err = ESP_OK;
+        xSemaphoreTake(s_draw_mu, portMAX_DELAY);
+        if (s_img && !s_paused) {
+            if (s_panel && s_own) {
+                err = compose(idx >= 0 ? s_dec_buf[idx] : NULL, &f);
+            } else if (!s_panel && idx >= 0) {
+                err = compose_lvgl(s_dec_buf[idx], &f);
+            }
+        }
+        view_t v = s_view;
+        xSemaphoreGive(s_draw_mu);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "draw: %s", esp_err_to_name(err));
+            s_stats.problem = "scaling failed";
+            continue;
+        }
+        if (!fresh || idx < 0) {
+            continue;
+        }
+        s_scale_us += esp_timer_get_time() - t0;
+        s_stats.problem = NULL;
+        s_stats.src_w = f.w;
+        s_stats.src_h = f.h;
+        s_stats.x = v.ox;
+        s_stats.y = v.oy;
+        s_stats.w = v.ow;
+        s_stats.h = v.oh;
+        count_frame();
+    }
+}
+
+void video_set_flip(bool flip)
+{
+    if (!s_draw_mu) {
+        s_flip = flip;
+        return;
+    }
+    xSemaphoreTake(s_draw_mu, portMAX_DELAY);
+    s_flip = flip;
+    s_ovl_n = 0; /* turned the old way: the UI hands them in again */
+    s_gen++;
+    s_redraw = true;
+    xSemaphoreGive(s_draw_mu);
+    xTaskNotifyGive(s_draw_task);
+}
+
+bool video_flipped(void)
+{
+    return s_flip;
+}
+
+void video_set_zoom(float zoom, float cx, float cy)
+{
+    if (!s_draw_mu) {
+        return;
+    }
+    xSemaphoreTake(s_draw_mu, portMAX_DELAY);
+    s_zoom = zoom < 1 ? 1 : zoom > 8 ? 8 : zoom;
+    s_zcx = cx;
+    s_zcy = cy;
+    s_redraw = true;
+    xSemaphoreGive(s_draw_mu);
+    xTaskNotifyGive(s_draw_task);
+}
+
+void video_get_zoom(float *zoom, float *cx, float *cy)
+{
+    *zoom = s_zoom;
+    *cx = s_zcx;
+    *cy = s_zcy;
+}
+
+bool video_to_target(int x, int y, float *u, float *v)
+{
+    view_t w = s_view;
+    if (w.ow <= 0 || w.oh <= 0 || s_stats.src_w <= 0) {
+        return false;
+    }
+    float fx = w.sx + (x - w.ox) / w.sc;
+    float fy = w.sy + (y - w.oy) / w.sc;
+    *u = fx / s_stats.src_w;
+    *v = fy / s_stats.src_h;
+    *u = *u < 0 ? 0 : *u > 1 ? 1 : *u;
+    *v = *v < 0 ? 0 : *v > 1 ? 1 : *v;
+    return x >= w.ox && x < w.ox + w.ow && y >= w.oy && y < w.oy + w.oh;
+}
+
+float video_scale(void)
+{
+    return s_view.sc > 0 ? s_view.sc : 1;
 }
 
 void video_get_stats(video_stats_t *out)

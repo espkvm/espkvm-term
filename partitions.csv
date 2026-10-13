@@ -1,4 +1,8 @@
 # Name,   Type, SubType, Offset,   Size
 # nvs at 0x9000 like the stock tables, so a launcher's NVS stays where it expects.
+# Two app slots: an update goes into the other one, and the bootloader goes
+# back if the new one never comes up.
 nvs,      data, nvs,     0x9000,   0x6000,
-factory,  app,  factory, 0x10000,  0x400000,
+otadata,  data, ota,     0xf000,   0x2000,
+ota_0,    app,  ota_0,   0x20000,  0x400000,
+ota_1,    app,  ota_1,   0x420000, 0x400000,

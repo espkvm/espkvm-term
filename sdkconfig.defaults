@@ -63,3 +63,6 @@ CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
 # esp-hosted SDIO buffer (internal DMA RAM) straight back: with a 64 KB TCP
 # window the held buffers ran internal RAM out and the picture socket died.
 CONFIG_LWIP_L2_TO_L3_COPY=y
+
+# An update that never gets onto the network is rolled back at the next boot
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

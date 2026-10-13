@@ -24,6 +24,11 @@
 #include "ts.h"
 #include "ui.h"
 #include "textview.h"
+#include "touch.h"
+#include "usbhid.h"
+#include "power.h"
+#include "ota.h"
+#include "orient.h"
 #include "video.h"
 
 static const char *TAG = "term";
@@ -56,6 +61,9 @@ static uint32_t lv_key_of(const kbd_event_t *ev)
 
 static void on_key(const kbd_event_t *ev)
 {
+    if (power_activity()) {
+        return; /* it only woke the screen */
+    }
     if (ui_current() == UI_VIEW) {
         ui_view_key(ev); /* typing goes to the target */
         return;
@@ -75,11 +83,26 @@ static void inject_key(uint32_t key)
     xQueueSend(s_keys, &k, 0);
 }
 
-static void on_kbd_presence(bool present)
+/* Either keyboard - the Tab5 one or one in the USB port - hides the on-screen one. */
+static bool s_tab5_kbd, s_usb_kbd;
+
+static void kbd_presence_changed(void)
 {
     bsp_display_lock(0);
-    ui_hw_keyboard(present);
+    ui_hw_keyboard(s_tab5_kbd || s_usb_kbd);
     bsp_display_unlock();
+}
+
+static void on_kbd_presence(bool present)
+{
+    s_tab5_kbd = present;
+    kbd_presence_changed();
+}
+
+static void on_usb_kbd_presence(bool present)
+{
+    s_usb_kbd = present;
+    kbd_presence_changed();
 }
 
 /* The first time Wi-Fi is up, go to the saved device straight away. */
@@ -88,6 +111,9 @@ static void on_net_state(net_state_t st, const char *info)
     static bool tried;
     ui_wifi_on_state(st, info);
     ts_net_up(st == NET_CONNECTED);
+    if (st == NET_CONNECTED) {
+        ota_good(); /* up and on the network: the bootloader may keep this image */
+    }
     if (st == NET_CONNECTED && !tried) {
         tried = true;
         link_cfg_t saved;
@@ -119,6 +145,7 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    ota_init();
 
     /* The BSP aborts if the IO expander misses its first command, which
      * happens now and then right after a reset: wait until it answers. */
@@ -137,7 +164,7 @@ void app_main(void)
         ESP_LOGE(TAG, "display did not start");
         return;
     }
-    bsp_display_brightness_set(20); /* dim: easy on the eyes, cooler */
+    power_start(20); /* dim by default: easy on the eyes, cooler */
 
     esp_io_expander_handle_t exp = bsp_io_expander_init();
     if (exp) {
@@ -150,6 +177,7 @@ void app_main(void)
     bsp_display_lock(0);
     bsp_display_rotate(disp, LV_DISPLAY_ROTATION_90);
     theme_init();
+    touch_init();
     lv_group_t *keys = lv_group_create();
     lv_indev_t *kp = lv_indev_create();
     lv_indev_set_type(kp, LV_INDEV_TYPE_KEYPAD);
@@ -163,7 +191,9 @@ void app_main(void)
     ui_show(UI_WIFI);
     bsp_display_unlock();
 
+    orient_start();
     kbd_start(on_key, on_kbd_presence);
+    usbhid_start(on_key, on_usb_kbd_presence, ui_view_mouse);
     debug_link_start(inject_key);
     ESP_LOGI(TAG, "up");
 }

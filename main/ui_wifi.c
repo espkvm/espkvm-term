@@ -13,7 +13,7 @@
 #include "ui.h"
 
 /* NULL while the screen is not shown. */
-static lv_obj_t *s_root, *s_list, *s_ssid, *s_pass, *s_status, *s_lamp, *s_next;
+static lv_obj_t *s_root, *s_list, *s_ssid, *s_pass, *s_status, *s_lamp, *s_next, *s_forget;
 
 /* The last network news, kept for when the screen is built again. */
 static net_state_t s_state = NET_OFF;
@@ -29,6 +29,8 @@ static void list_note(const char *text)
     lv_obj_set_style_pad_all(l, 8, 0);
 }
 
+static void fill_list(void);
+
 static void connect(void)
 {
     const char *ssid = lv_textarea_get_text(s_ssid);
@@ -38,6 +40,24 @@ static void connect(void)
     }
     ui_kb_hide();
     net_connect(ssid, lv_textarea_get_text(s_pass));
+}
+
+/* FORGET only for a network the Tab5 remembers */
+static void show_forget(void)
+{
+    lv_obj_set_hidden(s_forget, !net_is_saved(lv_textarea_get_text(s_ssid)));
+}
+
+static void ssid_changed(lv_event_t *e)
+{
+    show_forget();
+}
+
+static void forget_clicked(lv_event_t *e)
+{
+    net_forget(lv_textarea_get_text(s_ssid));
+    show_forget();
+    fill_list();
 }
 
 static void ssid_ready(lv_event_t *e)
@@ -55,8 +75,8 @@ static void ap_clicked(lv_event_t *e)
     lv_obj_t *row = lv_event_get_current_target(e);
     lv_textarea_set_text(s_ssid, lv_label_get_text(lv_obj_get_child(row, 1)));
     lv_textarea_set_text(s_pass, "");
-    if (lv_obj_get_user_data(row)) { /* open network */
-        connect();
+    if (lv_obj_get_user_data(row) || net_is_saved(lv_textarea_get_text(s_ssid))) {
+        connect(); /* open, or the password is saved */
     } else {
         lv_group_focus_obj(s_pass);
     }
@@ -135,7 +155,9 @@ static void fill_list(void)
         lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
         lv_obj_set_flex_grow(name, 1);
         lv_obj_set_user_data(row, (void *)s_aps[i].open);
-        if (s_aps[i].open) {
+        if (net_is_saved(s_aps[i].ssid)) {
+            th_label(row, "SAVED");
+        } else if (s_aps[i].open) {
             lv_obj_t *tag = th_label(row, "OPEN");
             lv_obj_set_style_text_color(tag, lv_color_hex(TH_DIM), 0);
         }
@@ -190,13 +212,17 @@ void ui_wifi_on_state(net_state_t st, const char *info)
     strlcpy(s_info, info, sizeof(s_info));
     if (s_root) {
         show_state();
+        if (st == NET_CONNECTED) { /* just saved */
+            show_forget();
+            fill_list();
+        }
     }
     bsp_display_unlock();
 }
 
 static void root_deleted(lv_event_t *e)
 {
-    s_root = s_list = s_ssid = s_pass = s_status = s_lamp = s_next = NULL;
+    s_root = s_list = s_ssid = s_pass = s_status = s_lamp = s_next = s_forget = NULL;
 }
 
 void ui_wifi_build(void)
@@ -258,6 +284,7 @@ void ui_wifi_build(void)
     s_ssid = th_field(right);
     lv_textarea_set_max_length(s_ssid, 32);
     ui_field(s_ssid, ssid_ready);
+    lv_obj_add_event_cb(s_ssid, ssid_changed, LV_EVENT_VALUE_CHANGED, NULL);
     th_label(right, "PASSWORD");
     s_pass = th_field(right);
     lv_textarea_set_max_length(s_pass, 64);
@@ -280,10 +307,13 @@ void ui_wifi_build(void)
     lv_obj_t *btn = th_button(row, "CONNECT");
     lv_obj_set_flex_grow(btn, 1);
     lv_obj_add_event_cb(btn, connect_clicked, LV_EVENT_CLICKED, NULL);
+    s_forget = th_button(row, "FORGET");
+    lv_obj_add_event_cb(s_forget, forget_clicked, LV_EVENT_CLICKED, NULL);
     s_next = th_button(row, "DEVICE " LV_SYMBOL_RIGHT);
     lv_obj_add_event_cb(s_next, next_clicked, LV_EVENT_CLICKED, NULL);
 
     lv_textarea_set_text(s_ssid, net_saved_ssid());
+    show_forget();
     fill_list();
     show_state();
 }

@@ -209,6 +209,11 @@ static void back_clicked(lv_event_t *e)
     ui_show(UI_WIFI);
 }
 
+static void term_clicked(lv_event_t *e)
+{
+    ui_show(UI_UPDATE);
+}
+
 static void ts_clicked(lv_event_t *e)
 {
     ui_show(UI_TS);
@@ -376,13 +381,17 @@ void ui_device_build(void)
     lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(nav, 10, 0);
     lv_obj_t *back = th_button(nav, LV_SYMBOL_LEFT " WI-FI");
-    lv_obj_set_style_text_font(back, &font_ui_26, 0);
+    lv_obj_set_style_text_font(back, &font_ui_20, 0);
     lv_obj_set_flex_grow(back, 1);
     lv_obj_add_event_cb(back, back_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *ts = th_button(nav, "TAILSCALE");
-    lv_obj_set_style_text_font(ts, &font_ui_26, 0);
+    lv_obj_set_style_text_font(ts, &font_ui_20, 0);
     lv_obj_set_flex_grow(ts, 1);
     lv_obj_add_event_cb(ts, ts_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *term = th_button(nav, "TERMINAL");
+    lv_obj_set_style_text_font(term, &font_ui_20, 0);
+    lv_obj_set_flex_grow(term, 1);
+    lv_obj_add_event_cb(term, term_clicked, LV_EVENT_CLICKED, NULL);
 
     /* The trust question, over everything */
     s_trust = th_panel(lv_screen_active());

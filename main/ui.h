@@ -14,7 +14,7 @@
 #include "net.h"
 #include "tab5kbd.h"
 
-typedef enum { UI_WIFI, UI_DEVICE, UI_VIEW, UI_TS } ui_screen_t;
+typedef enum { UI_WIFI, UI_DEVICE, UI_VIEW, UI_TS, UI_UPDATE } ui_screen_t;
 
 /* LVGL lock held for all of these unless said otherwise. */
 void ui_init(lv_group_t *keys);
@@ -33,6 +33,7 @@ void ui_wifi_build(void);
 void ui_device_build(void);
 void ui_view_build(void);
 void ui_ts_build(void);
+void ui_update_build(void);
 /* The next device screen starts with this address in the field. */
 void ui_device_prefill(const char *host);
 /* News for the screens, from any task. */
@@ -42,3 +43,5 @@ void ui_device_on_state(link_state_t st, const char *info);
 void ui_view_on_msg(const uint8_t *data, size_t len);
 /* A key from the Tab5 keyboard while the view is up (any task). */
 void ui_view_key(const kbd_event_t *ev);
+/* A mouse in the Tab5's USB port, while the view is up (any task). */
+void ui_view_mouse(uint8_t buttons, int dx, int dy, int wheel);

@@ -14,8 +14,10 @@
 typedef struct {
     int src_w, src_h;     /* the target's picture */
     int x, y, w, h;       /* where it lands on the 1280x720 screen */
-    float fps;
+    float fps;            /* drawn */
+    float in_fps;         /* arrived */
     int decode_ms;
+    int64_t shown_at;     /* esp_timer time of the last frame drawn */
     const char *problem;  /* why nothing shows, or NULL */
 } video_stats_t;
 
@@ -41,3 +43,16 @@ void video_pause(bool on);
 /* From the link's video task. */
 void video_frame(const kvm_video_hdr_t *hdr, const uint8_t *data, size_t len);
 void video_get_stats(video_stats_t *out);
+/* Zoom: 1 = the whole picture; above 1 a part of it, centred on (cx, cy) in
+ * the target's pixels. Up to 8. */
+void video_set_zoom(float zoom, float cx, float cy);
+void video_get_zoom(float *zoom, float *cx, float *cy);
+/* A screen point as a place on the target's picture, 0..1 each way (clamped);
+ * false if the point is off the picture or there is none yet. */
+bool video_to_target(int x, int y, float *u, float *v);
+/* The Tab5 is upside down: the picture and the overlays are turned the
+ * other way (LVGL is turned by the caller). */
+void video_set_flip(bool flip);
+bool video_flipped(void);
+/* Screen pixels per target pixel as drawn now. */
+float video_scale(void);

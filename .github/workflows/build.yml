@@ -1,0 +1,76 @@
+name: build
+
+# Every push builds; a tag (v1.2.3) also makes a GitHub release, which is
+# where the terminal's own update looks.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # The firmware repository sits next to this one: the wire protocol
+      # (components/kvm_proto) and the Tailscale client (microlink) come from it.
+      - uses: actions/checkout@v4
+        with:
+          path: espkvm-term
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: espkvm/espkvm
+          path: espkvm
+      - name: Fetch microlink
+        run: git -C espkvm submodule update --init --depth 1 third_party/microlink
+
+      # A tag is the version; without it the image reports the commit.
+      - name: Take the version from the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: echo "${GITHUB_REF_NAME}" > espkvm-term/version.txt
+
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.1
+          target: esp32p4
+          path: espkvm-term
+          # git inside the container refuses a checkout owned by another user,
+          # and merge-bin needs the esptool that ships with this IDF.
+          command: >-
+            git config --global --add safe.directory '*' &&
+            idf.py build &&
+            idf.py merge-bin -o espkvm-term-merged.bin
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp espkvm-term/build/espkvm-term.bin out/
+          cp espkvm-term/build/espkvm-term-merged.bin out/
+          (cd out && sha256sum ./* > sha256sums.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: espkvm-term
+          path: out/
+
+      # The notes are this version's section of CHANGELOG.md.
+      - name: Release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '/^## \[/ { on = index($0, "[" v "]") > 0; next } on' \
+            espkvm-term/CHANGELOG.md > notes.md
+          test -s notes.md
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          body_path: notes.md

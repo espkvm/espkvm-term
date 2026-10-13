@@ -74,5 +74,10 @@ void link_disconnect(void);
 bool link_online(void);
 /* Sends one /ws message (binary). False if not online. */
 bool link_send(const uint8_t *msg, size_t len);
+/* The screen is off (false): close /video so nothing is sent for nobody;
+ * true opens it again. The link stays signed in either way. */
+void link_video(bool on);
+/* The sockets' state into the log. */
+void link_debug(void);
 /* Asks /video for a keyframe. */
 void link_request_keyframe(void);

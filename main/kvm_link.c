@@ -36,6 +36,7 @@ typedef enum {
     CMD_FORGET,
     CMD_ACTION,
     CMD_TEXT,
+    CMD_VIDEO,
 } cmd_kind_t;
 typedef struct {
     cmd_kind_t kind;
@@ -75,10 +76,13 @@ static volatile int s_video_gen = 1;
 #define RETRY_MIN_MS 2000
 #define RETRY_MAX_MS 30000
 #define OPEN_WAIT_MS 20000
+#define WS_SILENT_MS 10000
 static bool s_session;              /* signed in, keep the link up */
 static volatile bool s_broken;      /* a socket dropped */
+static volatile bool s_video_off;   /* the screen is off: no /video, and that is fine */
 static volatile bool s_video_lost;  /* only /video dropped: open it again, no new sign-in */
 static int64_t s_opened_at, s_retry_at;
+static volatile int64_t s_ws_heard; /* last frame on /ws */
 static int s_retry_ms = RETRY_MIN_MS;
 
 /* Video frame reassembly (a frame arrives in several pieces). */
@@ -365,10 +369,11 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             esp_websocket_client_send_bin(s_video, (const char *)&sub, 1, pdMS_TO_TICKS(1000));
         } else {
             s_ws_up = true;
+            s_ws_heard = esp_timer_get_time();
             uint8_t ping = WS_C2D_PING;
             esp_websocket_client_send_bin(s_ws, (const char *)&ping, 1, pdMS_TO_TICKS(1000));
         }
-        if (s_ws_up && s_video_up) {
+        if (s_ws_up && (s_video_up || s_video_off)) {
             s_retry_ms = RETRY_MIN_MS;
             state(LINK_ONLINE, s_cfg.host);
         }
@@ -390,6 +395,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
         break;
     case WEBSOCKET_EVENT_DATA:
+        if (!video) {
+            s_ws_heard = esp_timer_get_time();
+        }
         if (video && s_text) {
             /* JSON readings; text frames, maybe in pieces */
             if ((d->op_code != 0x1 && d->op_code != 0x0) || d->payload_len >= FRAME_MAX) {
@@ -435,6 +443,18 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
 }
 
+/* A live /video socket is closed properly first: destroying one that is
+ * still streaming hung the link task (seen going to sleep). */
+static void video_close(void)
+{
+    if (!s_video) {
+        return;
+    }
+    esp_websocket_client_close(s_video, pdMS_TO_TICKS(1000));
+    esp_websocket_client_destroy(s_video);
+    s_video = NULL;
+}
+
 static esp_websocket_client_handle_t ws_open(const char *path, bool video)
 {
     char uri[128], headers[128];
@@ -453,6 +473,13 @@ static esp_websocket_client_handle_t ws_open(const char *path, bool video)
         /* A silent connection is cut within seconds somewhere on the way (seen
          * on Wi-Fi, -0x50 on the device); /ws also gets 0x06 from the keepalive. */
         .ping_interval_sec = 3,
+        /* A peer gone without a word leaves the client waiting for the rest
+         * of a frame forever (it times out with 0 and tries again); the
+         * keepalive turns that into an error. */
+        .keep_alive_enable = true,
+        .keep_alive_idle = 3,
+        .keep_alive_interval = 2,
+        .keep_alive_count = 3,
     };
     esp_websocket_client_handle_t h = esp_websocket_client_init(&c);
     if (!h) {
@@ -489,7 +516,7 @@ static void reopen_video(void)
     }
     s_video_gen++;
     s_video_up = false;
-    esp_websocket_client_destroy(s_video);
+    video_close();
     s_opened_at = esp_timer_get_time();
     s_video = ws_open("/video", true);
     if (!s_video) {
@@ -616,8 +643,8 @@ static bool sign_in(void)
     state(LINK_WORKING, "opening the screen");
     s_opened_at = esp_timer_get_time();
     s_ws = ws_open("/ws", false);
-    s_video = ws_open("/video", true);
-    if (!s_ws || !s_video) {
+    s_video = s_video_off ? NULL : ws_open("/video", true);
+    if (!s_ws || (!s_video && !s_video_off)) {
         close_all();
         state(LINK_FAILED, "could not open the sockets");
         return false;
@@ -650,7 +677,12 @@ static void watch(void)
         s_broken = true;
     }
     s_video_lost = false;
-    bool stuck = s_ws && !(s_ws_up && s_video_up) && now - s_opened_at > OPEN_WAIT_MS * 1000LL;
+    /* /ws answers the ping every 2.5 s: silence means it is gone */
+    if (s_ws_up && !s_broken && now - s_ws_heard > WS_SILENT_MS * 1000LL) {
+        ESP_LOGI(TAG, "/ws silent");
+        s_broken = true;
+    }
+    bool stuck = s_ws && !(s_ws_up && (s_video_up || s_video_off)) && now - s_opened_at > OPEN_WAIT_MS * 1000LL;
     if (s_ws && !s_broken && !stuck) {
         return;
     }
@@ -761,6 +793,25 @@ static void link_task(void *arg)
                 reopen_video();
             }
             break;
+        case CMD_VIDEO:
+            /* Off: the socket goes, nothing arrives; on: a new one, signed in already */
+            if (!c.on && !s_video_off) {
+                s_video_off = true;
+                s_video_gen++;
+                s_video_up = false;
+                video_close();
+            } else if (c.on && s_video_off) {
+                s_video_off = false;
+                if (s_ws) {
+                    s_video_gen++;
+                    s_opened_at = esp_timer_get_time();
+                    s_video = ws_open("/video", true);
+                    if (!s_video) {
+                        s_broken = true;
+                    }
+                }
+            }
+            break;
         }
     }
 }
@@ -800,7 +851,13 @@ void link_disconnect(void)
 
 bool link_online(void)
 {
-    return s_ws_up && s_video_up;
+    return s_ws_up && (s_video_up || s_video_off);
+}
+
+void link_video(bool on)
+{
+    cmd_t c = {.kind = CMD_VIDEO, .on = on};
+    xQueueSend(s_cmds, &c, 0);
 }
 
 bool link_send(const uint8_t *msg, size_t len)
@@ -809,6 +866,14 @@ bool link_send(const uint8_t *msg, size_t len)
         return false;
     }
     return esp_websocket_client_send_bin(s_ws, (const char *)msg, len, pdMS_TO_TICKS(200)) >= 0;
+}
+
+void link_debug(void)
+{
+    ESP_LOGI(TAG, "%s (%s): ws %s/%s, video %s/%s%s, gen %d, session %d, broken %d", s_cfg.host, s_addr,
+             s_ws ? "open" : "none",
+             s_ws_up ? "up" : "down", s_video ? "open" : "none", s_video_up ? "up" : "down",
+             s_video_off ? " (off)" : "", s_video_gen, s_session, s_broken);
 }
 
 void link_request_keyframe(void)
@@ -855,6 +920,36 @@ bool link_text(void)
 
 static link_found_cb_t s_found_cb;
 
+/* Anything on the network may offer HTTPS (routers, printers): an ESP-KVM
+ * is the one whose sign-in endpoint answers with its own JSON. No CA is
+ * checked here; nothing is sent but the GET. */
+static bool is_espkvm(const esp_ip_addr_t *ip)
+{
+    char url[64], body[256];
+    if (ip->type != ESP_IPADDR_TYPE_V4) {
+        return false;
+    }
+    snprintf(url, sizeof(url), "https://" IPSTR "/api/v1/auth/session", IP2STR(&ip->u_addr.ip4));
+    esp_http_client_config_t c = {
+        .url = url,
+        .skip_cert_common_name_check = true,
+        .timeout_ms = 3000,
+        .buffer_size = 1024,
+    };
+    esp_http_client_handle_t h = esp_http_client_init(&c);
+    if (!h) {
+        return false;
+    }
+    int len = 0;
+    if (esp_http_client_open(h, 0) == ESP_OK && esp_http_client_fetch_headers(h) >= 0 &&
+        esp_http_client_get_status_code(h) == 200) {
+        len = esp_http_client_read(h, body, sizeof(body) - 1);
+    }
+    esp_http_client_cleanup(h);
+    body[len > 0 ? len : 0] = 0;
+    return strstr(body, "\"authenticated\"") && strstr(body, "\"required\"");
+}
+
 static void discover_task(void *arg)
 {
     static link_found_t found[LINK_MAX_FOUND];
@@ -872,7 +967,7 @@ static void discover_task(void *arg)
             for (int i = 0; i < n; i++) {
                 dup |= !strcmp(found[i].host, host);
             }
-            if (dup) {
+            if (dup || !r->addr || !is_espkvm(&r->addr->addr)) {
                 continue;
             }
             strlcpy(found[n].host, host, sizeof(found[n].host));

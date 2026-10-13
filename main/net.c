@@ -15,18 +15,31 @@
 #include "mdns.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #include "nvs.h"
 
 static const char *TAG = "net";
 
 #define NVS_NS "net"
 #define RETRIES 3
+#define KNOWN_RETRIES 5 /* then look around for another saved network */
 
 static net_state_cb_t s_on_state;
 static net_scan_cb_t s_on_scan;
 static bool s_up;
-static char s_saved_ssid[33];
+/* Saved networks, the last one joined first. Slot 0 keeps the NVS keys of
+ * the single network saved before. */
+typedef struct {
+    char ssid[33], pass[65];
+} saved_t;
+static saved_t s_saved[NET_SAVED_MAX];
+static int s_n_saved;
+static SemaphoreHandle_t s_saved_mu;
+/* The next scan picks the strongest saved network and joins it. */
+static bool s_pick;
+static esp_timer_handle_t s_rescan;
 /* The network being joined; saved to NVS only once it gives an address. */
 static char s_ssid[33], s_pass[65];
 static bool s_unsaved;
@@ -40,9 +53,25 @@ static void state(net_state_t st, const char *info)
     s_on_state(st, info ? info : "");
 }
 
-const char *net_saved_ssid(void)
+static void slot_keys(int i, char *ssid_key, char *pass_key)
 {
-    return s_saved_ssid;
+    if (i == 0) {
+        strcpy(ssid_key, "ssid");
+        strcpy(pass_key, "pass");
+    } else {
+        sprintf(ssid_key, "ssid%d", i);
+        sprintf(pass_key, "pass%d", i);
+    }
+}
+
+static int find_saved(const char *ssid)
+{
+    for (int i = 0; i < s_n_saved; i++) {
+        if (!strcmp(s_saved[i].ssid, ssid)) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static void load_saved(void)
@@ -51,28 +80,83 @@ static void load_saved(void)
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
         return;
     }
-    size_t n = sizeof(s_ssid);
-    if (nvs_get_str(h, "ssid", s_ssid, &n) == ESP_OK) {
-        n = sizeof(s_pass);
-        if (nvs_get_str(h, "pass", s_pass, &n) != ESP_OK) {
-            s_pass[0] = 0;
+    for (int i = 0; i < NET_SAVED_MAX; i++) {
+        char sk[8], pk[8];
+        slot_keys(i, sk, pk);
+        saved_t *e = &s_saved[s_n_saved];
+        size_t n = sizeof(e->ssid);
+        if (nvs_get_str(h, sk, e->ssid, &n) != ESP_OK || !e->ssid[0]) {
+            continue;
         }
-        strcpy(s_saved_ssid, s_ssid);
+        n = sizeof(e->pass);
+        if (nvs_get_str(h, pk, e->pass, &n) != ESP_OK) {
+            e->pass[0] = 0;
+        }
+        s_n_saved++;
     }
     nvs_close(h);
 }
 
-static void save(void)
+/* Lock held. */
+static void store_saved(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
         return;
     }
-    nvs_set_str(h, "ssid", s_ssid);
-    nvs_set_str(h, "pass", s_pass);
+    for (int i = 0; i < NET_SAVED_MAX; i++) {
+        char sk[8], pk[8];
+        slot_keys(i, sk, pk);
+        if (i < s_n_saved) {
+            nvs_set_str(h, sk, s_saved[i].ssid);
+            nvs_set_str(h, pk, s_saved[i].pass);
+        } else {
+            nvs_erase_key(h, sk);
+            nvs_erase_key(h, pk);
+        }
+    }
     nvs_commit(h);
     nvs_close(h);
-    strcpy(s_saved_ssid, s_ssid);
+}
+
+/* The network just joined goes first; the oldest drops off the end. */
+static void save(void)
+{
+    xSemaphoreTake(s_saved_mu, portMAX_DELAY);
+    int i = find_saved(s_ssid);
+    if (i < 0) {
+        i = s_n_saved < NET_SAVED_MAX ? s_n_saved++ : NET_SAVED_MAX - 1;
+    }
+    memmove(&s_saved[1], &s_saved[0], i * sizeof(saved_t));
+    strlcpy(s_saved[0].ssid, s_ssid, sizeof(s_saved[0].ssid));
+    strlcpy(s_saved[0].pass, s_pass, sizeof(s_saved[0].pass));
+    store_saved();
+    xSemaphoreGive(s_saved_mu);
+}
+
+const char *net_saved_ssid(void)
+{
+    return s_n_saved ? s_saved[0].ssid : "";
+}
+
+bool net_is_saved(const char *ssid)
+{
+    xSemaphoreTake(s_saved_mu, portMAX_DELAY);
+    bool yes = find_saved(ssid) >= 0;
+    xSemaphoreGive(s_saved_mu);
+    return yes;
+}
+
+void net_forget(const char *ssid)
+{
+    xSemaphoreTake(s_saved_mu, portMAX_DELAY);
+    int i = find_saved(ssid);
+    if (i >= 0) {
+        memmove(&s_saved[i], &s_saved[i + 1], (s_n_saved - i - 1) * sizeof(saved_t));
+        s_n_saved--;
+        store_saved();
+    }
+    xSemaphoreGive(s_saved_mu);
 }
 
 static void join(void)
@@ -87,6 +171,8 @@ static void join(void)
     esp_wifi_connect();
     state(NET_CONNECTING, s_ssid);
 }
+
+static void pick(const net_ap_t *aps, int n);
 
 static int ap_cmp(const void *a, const void *b)
 {
@@ -127,8 +213,46 @@ static void scan_done(void)
         esp_wifi_clear_ap_list();
     }
     s_on_scan(aps, count);
+    if (s_pick) {
+        s_pick = false;
+        pick(aps, count);
+    }
     free(recs);
     free(aps);
+}
+
+/* The strongest saved network in range; none seen (or hidden): the last one
+ * joined, and a fresh look after a while. */
+static void pick(const net_ap_t *aps, int n)
+{
+    xSemaphoreTake(s_saved_mu, portMAX_DELAY);
+    int best = -1;
+    for (int i = 0; i < n && best < 0; i++) {
+        best = find_saved(aps[i].ssid);
+    }
+    if (best < 0 && s_n_saved) {
+        best = 0;
+    }
+    if (best >= 0) {
+        strlcpy(s_ssid, s_saved[best].ssid, sizeof(s_ssid));
+        strlcpy(s_pass, s_saved[best].pass, sizeof(s_pass));
+    }
+    xSemaphoreGive(s_saved_mu);
+    if (best < 0) {
+        state(NET_IDLE, NULL);
+        return;
+    }
+    s_unsaved = false;
+    join();
+}
+
+static void rescan(void *arg)
+{
+    s_pick = true;
+    net_scan();
+    if (s_scan_pending) { /* the radio is busy: once more in a moment */
+        esp_timer_start_once(s_rescan, 2000000);
+    }
 }
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -140,8 +264,15 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (!s_ssid[0]) {
             return;
         }
-        /* A known network that drops out: keep trying. A new one: give up soon. */
-        if (!s_unsaved || ++s_retries < RETRIES) {
+        /* A known network that drops out: try it a while, then look around
+         * for the strongest saved one. A new one: give up soon. */
+        if (!s_unsaved && ++s_retries >= KNOWN_RETRIES) {
+            s_ssid[0] = 0;
+            state(NET_CONNECTING, "looking for a saved network");
+            esp_timer_start_once(s_rescan, 2000000);
+            return;
+        }
+        if (!s_unsaved || s_retries++ < RETRIES - 1) {
             vTaskDelay(pdMS_TO_TICKS(s_unsaved ? 500 : 2000));
             esp_wifi_connect();
             state(NET_CONNECTING, s_ssid);
@@ -195,7 +326,7 @@ static void net_task(void *arg)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta = esp_netif_create_default_wifi_sta();
     mdns_init(); /* to find "name.local" devices */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_wifi_init(&cfg);
@@ -213,14 +344,26 @@ static void net_task(void *arg)
     }
     s_up = true;
 
+    /* The name the router lists this Tab5 under (DHCP option 12), told apart
+     * from another Tab5 by the end of the MAC */
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    char name[24];
+    snprintf(name, sizeof(name), "espkvm-term-%02x%02x", mac[4], mac[5]);
+    esp_netif_set_hostname(sta, name);
+    ESP_LOGI(TAG, "named %s", name);
+
     esp_hosted_coprocessor_fwver_t ver = {0};
     if (esp_hosted_get_coprocessor_fwversion(&ver) == ESP_OK) {
         ESP_LOGI(TAG, "C6 esp-hosted %lu.%lu.%lu", (unsigned long)ver.major1,
                  (unsigned long)ver.minor1, (unsigned long)ver.patch1);
     }
 
-    if (s_ssid[0]) {
-        join();
+    const esp_timer_create_args_t ta = {.callback = rescan, .name = "rescan"};
+    esp_timer_create(&ta, &s_rescan);
+    if (s_n_saved) {
+        state(NET_CONNECTING, "looking for a saved network");
+        s_pick = true;
     } else {
         state(NET_IDLE, NULL);
     }
@@ -232,6 +375,7 @@ void net_start(net_state_cb_t on_state, net_scan_cb_t on_scan)
 {
     s_on_state = on_state;
     s_on_scan = on_scan;
+    s_saved_mu = xSemaphoreCreateMutex();
     load_saved();
     state(NET_OFF, "starting Wi-Fi");
     xTaskCreate(net_task, "net", 6144, NULL, 5, NULL);
@@ -256,9 +400,18 @@ void net_connect(const char *ssid, const char *pass)
         return;
     }
     s_ssid[0] = 0; /* the disconnect below must not retry the old one */
+    s_pick = false;
+    esp_timer_stop(s_rescan);
     esp_wifi_disconnect();
     strlcpy(s_ssid, ssid, sizeof(s_ssid));
     strlcpy(s_pass, pass, sizeof(s_pass));
+    /* No password typed for a saved network: the saved one */
+    xSemaphoreTake(s_saved_mu, portMAX_DELAY);
+    int i = find_saved(ssid);
+    if (i >= 0 && !pass[0]) {
+        strlcpy(s_pass, s_saved[i].pass, sizeof(s_pass));
+    }
+    xSemaphoreGive(s_saved_mu);
     s_unsaved = true;
     join();
 }

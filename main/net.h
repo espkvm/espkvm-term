@@ -2,7 +2,8 @@
  * SPDX-FileCopyrightText: 2026 ESP-KVM contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Wi-Fi through the Tab5's ESP32-C6 (esp-hosted over SDIO).
+ * Wi-Fi through the Tab5's ESP32-C6 (esp-hosted over SDIO). Several networks
+ * are remembered; the strongest one in range is joined.
  */
 #pragma once
 
@@ -24,6 +25,7 @@ typedef struct {
 } net_ap_t;
 
 #define NET_MAX_APS 20
+#define NET_SAVED_MAX 5
 
 /* Called from the network task; take the LVGL lock before touching the UI. */
 typedef void (*net_state_cb_t)(net_state_t state, const char *info);
@@ -32,7 +34,11 @@ typedef void (*net_scan_cb_t)(const net_ap_t *aps, int n);
 /* Powers the C6 and brings Wi-Fi up in the background; joins the saved network. */
 void net_start(net_state_cb_t on_state, net_scan_cb_t on_scan);
 void net_scan(void);
-/* Joins and, once it works, remembers the network. */
+/* Joins and, once it works, remembers the network (up to NET_SAVED_MAX,
+ * the oldest is dropped). An empty password for a saved network uses the
+ * saved one. */
 void net_connect(const char *ssid, const char *pass);
-/* The remembered network's name, or "" */
+/* The network joined last, or "" */
 const char *net_saved_ssid(void);
+bool net_is_saved(const char *ssid);
+void net_forget(const char *ssid);
