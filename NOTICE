@@ -1,0 +1,13 @@
+ESP-KVM terminal
+Copyright 2026 Evgenij Spitsyn
+
+Licensed under the Apache License, Version 2.0. The full text is in LICENSE.
+
+Third-party parts, each with its license next to it:
+
+- Barlow Condensed and Saira Stencil One fonts: SIL OFL 1.1
+  (main/fonts/OFL-BarlowCondensed.txt, main/fonts/OFL-SairaStencilOne.txt)
+- DejaVu Sans Mono: Bitstream Vera license (main/fonts/LICENSE-DejaVu.txt)
+- Font Awesome symbols: SIL OFL 1.1 (main/fonts/LICENSE-FontAwesome.txt)
+- The Tab5 keyboard's registers and key table in main/tab5kbd.c, from
+  M5Stack's M5Unit-KEYBOARD: MIT (main/LICENSE-M5Unit-KEYBOARD.txt)

@@ -4,6 +4,8 @@
  */
 #include "kvm_link.h"
 
+#include "lwip/sockets.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -78,6 +80,35 @@ static volatile int s_video_gen = 1;
 #define OPEN_WAIT_MS 20000
 #define WS_SILENT_MS 10000
 static bool s_session;              /* signed in, keep the link up */
+static volatile int64_t s_loop_at; /* the link task's last turn */
+/* Latency, for the `link` debug line: /ws ping round trips, and how much later
+ * than the quickest one each frame arrives (its pts is the device's clock). */
+static int64_t s_ping_at;
+static bool s_acks = true;
+static bool s_dev_acks; /* the device said it takes acks (WS_D2C_VIDEO_ACKS) */
+static QueueHandle_t s_ack_q;
+static SemaphoreHandle_t s_video_mu; /* ack_task's send vs. the socket going away */
+
+static void ack_task(void *arg)
+{
+    uint32_t seq;
+    for (;;) {
+        if (xQueueReceive(s_ack_q, &seq, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        xSemaphoreTake(s_video_mu, portMAX_DELAY);
+        if (s_video && s_video_up) {
+            uint8_t ack[5] = {WS_C2D_VIDEO_ACK, (uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16),
+                              (uint8_t)(seq >> 24)};
+            esp_websocket_client_send_bin(s_video, (const char *)ack, sizeof(ack), pdMS_TO_TICKS(300));
+        }
+        xSemaphoreGive(s_video_mu);
+    }
+}
+static int s_rtt_min = 1 << 30, s_rtt_max, s_rtt_sum, s_rtt_n;
+static bool s_lag_base_set;
+static uint16_t s_lag_base;
+static int s_lag_floor = 1 << 30, s_lag_max, s_lag_sum, s_lag_n;
 static volatile bool s_broken;      /* a socket dropped */
 static volatile bool s_video_off;   /* the screen is off: no /video, and that is fine */
 static volatile bool s_video_lost;  /* only /video dropped: open it again, no new sign-in */
@@ -353,6 +384,21 @@ static bool describe(const char *pem, char *out, size_t outlen)
 
 /* ---- WebSockets ---- */
 
+/* The WebSocket client hides its socket, so turn Nagle off on every TCP socket
+ * once one connects. With it on, a small message (an ack, a ping) waited for
+ * the ACK of the one before, which the device delays: 400+ ms round trips. */
+static void nodelay_all(void)
+{
+    for (int fd = LWIP_SOCKET_OFFSET; fd < LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS; fd++) {
+        int type = 0;
+        socklen_t len = sizeof(type);
+        if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) == 0 && type == SOCK_STREAM) {
+            const int one = 1;
+            (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        }
+    }
+}
+
 static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     const esp_websocket_event_data_t *d = data;
@@ -363,8 +409,10 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
+        nodelay_all();
         if (video) {
             s_video_up = true;
+            s_dev_acks = false;
             uint8_t sub = s_text ? WS_SUBSCRIBE_TEXT : 1; /* 1 = the picture */
             esp_websocket_client_send_bin(s_video, (const char *)&sub, 1, pdMS_TO_TICKS(1000));
         } else {
@@ -419,11 +467,23 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
         if (!video) {
             if (d->payload_offset == 0 && d->data_len == d->payload_len) {
+                if (d->data_len >= 1 && (uint8_t)d->data_ptr[0] == WS_D2C_PONG && s_ping_at) {
+                    int rtt = (int)((esp_timer_get_time() - s_ping_at) / 1000);
+                    s_ping_at = 0;
+                    s_rtt_min = rtt < s_rtt_min ? rtt : s_rtt_min;
+                    s_rtt_max = rtt > s_rtt_max ? rtt : s_rtt_max;
+                    s_rtt_sum += rtt;
+                    s_rtt_n++;
+                }
                 s_on_msg((const uint8_t *)d->data_ptr, d->data_len);
             }
             break;
         }
         if (d->payload_len > FRAME_MAX) {
+            break;
+        }
+        if (d->payload_len == 1 && d->data_len == 1 && (uint8_t)d->data_ptr[0] == WS_D2C_VIDEO_ACKS) {
+            s_dev_acks = true; /* older firmware reads an ack as a keyframe request */
             break;
         }
         if (d->payload_offset == 0) {
@@ -434,6 +494,23 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (s_frame_len == (size_t)d->payload_len) {
             kvm_video_hdr_t hdr;
             if (kvm_video_hdr_read(s_frame, s_frame_len, &hdr)) {
+                uint16_t d16 = (uint16_t)((uint16_t)(esp_timer_get_time() / 1000) - hdr.pts_ms);
+                if (!s_lag_base_set) {
+                    s_lag_base = d16;
+                    s_lag_base_set = true;
+                }
+                int rel = (int16_t)(uint16_t)(d16 - s_lag_base);
+                s_lag_floor = rel < s_lag_floor ? rel : s_lag_floor;
+                s_lag_max = rel > s_lag_max ? rel : s_lag_max;
+                s_lag_sum += rel;
+                s_lag_n++;
+                /* Ack it: the device then keeps only VIDEO_ACK_WINDOW frames
+                 * on the way, not a full TCP buffer of old ones. Sent by
+                 * ack_task: a send from in here can miss the client's lock. */
+                if (s_acks && s_dev_acks && s_ack_q) {
+                    uint32_t seq = hdr.seq;
+                    xQueueSend(s_ack_q, &seq, 0);
+                }
                 s_on_frame(&hdr, s_frame + VIDEO_HDR_LEN, s_frame_len - VIDEO_HDR_LEN);
             }
         }
@@ -451,8 +528,10 @@ static void video_close(void)
         return;
     }
     esp_websocket_client_close(s_video, pdMS_TO_TICKS(1000));
+    xSemaphoreTake(s_video_mu, portMAX_DELAY);
     esp_websocket_client_destroy(s_video);
     s_video = NULL;
+    xSemaphoreGive(s_video_mu);
 }
 
 static esp_websocket_client_handle_t ws_open(const char *path, bool video)
@@ -501,8 +580,10 @@ static void close_all(void)
         s_ws = NULL;
     }
     if (s_video) {
+        xSemaphoreTake(s_video_mu, portMAX_DELAY);
         esp_websocket_client_destroy(s_video);
         s_video = NULL;
+        xSemaphoreGive(s_video_mu);
     }
     s_ws_up = s_video_up = false;
     s_broken = false;
@@ -738,6 +819,7 @@ static void link_task(void *arg)
 {
     cmd_t c;
     for (;;) {
+        s_loop_at = esp_timer_get_time();
         /* The console's keepalive: a ping on /ws every 2.5 s, answered with the status. */
         if (xQueueReceive(s_cmds, &c, pdMS_TO_TICKS(500)) != pdTRUE) {
             watch();
@@ -746,6 +828,7 @@ static void link_task(void *arg)
             if (s_ws_up && now - last_ping >= 2500000) {
                 last_ping = now;
                 uint8_t ping = WS_C2D_PING;
+                s_ping_at = esp_timer_get_time();
                 esp_websocket_client_send_bin(s_ws, (const char *)&ping, 1, pdMS_TO_TICKS(500));
             }
             continue;
@@ -825,6 +908,9 @@ void link_init(link_state_cb_t on_state, link_frame_cb_t on_frame, link_msg_cb_t
     s_cmds = xQueueCreate(6, sizeof(cmd_t));
     s_list_mu = xSemaphoreCreateMutex();
     load();
+    s_ack_q = xQueueCreate(8, sizeof(uint32_t));
+    s_video_mu = xSemaphoreCreateMutex();
+    xTaskCreate(ack_task, "ack", 3072, NULL, 6, NULL);
     xTaskCreate(link_task, "link", 8192, NULL, 5, NULL);
 }
 
@@ -870,10 +956,23 @@ bool link_send(const uint8_t *msg, size_t len)
 
 void link_debug(void)
 {
-    ESP_LOGI(TAG, "%s (%s): ws %s/%s, video %s/%s%s, gen %d, session %d, broken %d", s_cfg.host, s_addr,
+    ESP_LOGI(TAG, "%s (%s): ws %s/%s, video %s/%s%s, acks %s, gen %d, session %d, broken %d, task %lld ms ago",
+             s_cfg.host, s_addr,
              s_ws ? "open" : "none",
              s_ws_up ? "up" : "down", s_video ? "open" : "none", s_video_up ? "up" : "down",
-             s_video_off ? " (off)" : "", s_video_gen, s_session, s_broken);
+             s_video_off ? " (off)" : "", !s_acks ? "off" : s_dev_acks ? "on" : "not offered", s_video_gen, s_session, s_broken,
+             (long long)((esp_timer_get_time() - s_loop_at) / 1000));
+    /* Frame delay is relative to the quickest frame seen since the link came up
+     * (the clocks differ); the quickest is about half the shortest round trip. */
+    if (s_rtt_n || s_lag_n) {
+        ESP_LOGI(TAG, "ping rtt min/avg/max %d/%d/%d ms (%d); frames later than the quickest: avg %d, max %d ms (%d)",
+                 s_rtt_n ? s_rtt_min : -1, s_rtt_n ? s_rtt_sum / s_rtt_n : -1, s_rtt_max, s_rtt_n,
+                 s_lag_n ? s_lag_sum / s_lag_n - s_lag_floor : -1, s_lag_n ? s_lag_max - s_lag_floor : -1, s_lag_n);
+        s_rtt_min = 1 << 30;
+        s_rtt_max = s_rtt_sum = s_rtt_n = 0;
+        s_lag_max = s_lag_sum = s_lag_n = 0;
+        s_lag_max = -(1 << 30);
+    }
 }
 
 void link_request_keyframe(void)
@@ -993,4 +1092,14 @@ void link_discover(link_found_cb_t cb)
         s_found_cb = NULL;
         cb(NULL, 0);
     }
+}
+
+void link_set_acks(bool on)
+{
+    s_acks = on;
+}
+
+const char *link_ca(void)
+{
+    return s_ca;
 }

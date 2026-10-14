@@ -21,7 +21,9 @@
 #include "driver/usb_serial_jtag.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "kvm_link.h"
 #include "orient.h"
 #include "power.h"
@@ -173,6 +175,33 @@ static void tcp_probe(const char *arg)
     close(fd);
 }
 
+/* "dl http://host:port/file": Wi-Fi receive speed, nothing else involved */
+static void dl_test(const char *url)
+{
+    esp_http_client_config_t c = {.url = url, .timeout_ms = 10000, .buffer_size = 4096,
+                                  .cert_pem = link_ca(), .skip_cert_common_name_check = true};
+    esp_http_client_handle_t h = esp_http_client_init(&c);
+    if (!h || esp_http_client_open(h, 0) != ESP_OK) {
+        ESP_LOGW(TAG, "dl: open failed");
+        if (h) {
+            esp_http_client_cleanup(h);
+        }
+        return;
+    }
+    esp_http_client_fetch_headers(h);
+    static char buf[4096];
+    int64_t t0 = esp_timer_get_time();
+    long total = 0;
+    int n;
+    while ((n = esp_http_client_read(h, buf, sizeof(buf))) > 0) {
+        total += n;
+    }
+    int64_t us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG, "dl: %ld bytes in %lld ms = %lld KB/s", total, (long long)(us / 1000),
+             us ? (long long)(total * 1000000LL / us / 1024) : 0);
+    esp_http_client_cleanup(h);
+}
+
 static void handle(char *line)
 {
     int x, y;
@@ -229,6 +258,31 @@ static void handle(char *line)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     } else if (!strncmp(line, "tcp ", 4)) {
         tcp_probe(line + 4);
+    } else if (!strncmp(line, "host ", 5)) { /* sign in to another address, saved user */
+        link_cfg_t cfg;
+        link_saved(&cfg);
+        strlcpy(cfg.host, line + 5, sizeof(cfg.host));
+        link_connect(&cfg, NULL);
+    } else if (!strncmp(line, "acks ", 5)) {
+        link_set_acks(line[5] == '1');
+    } else if (!strncmp(line, "dl ", 3)) {
+        dl_test(line + 3);
+    } else if (!strcmp(line, "rssi")) {
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            ESP_LOGI(TAG, "wifi rssi %d dBm, channel %d, phy %s%s%s", ap.rssi, ap.primary,
+                     ap.phy_11b ? "b" : "", ap.phy_11g ? "g" : "", ap.phy_11n ? "n" : "");
+        }
+    } else if (!strcmp(line, "trust")) {
+        link_trust(true);
+    } else if (!strcmp(line, "sleep")) {
+        power_sleep();
+    } else if (!strncmp(line, "log ", 4)) { /* "log ml_wg_mgr 4" */
+        char tag[32];
+        int lvl;
+        if (sscanf(line + 4, "%31s %d", tag, &lvl) == 2) {
+            esp_log_level_set(tag, (esp_log_level_t)lvl);
+        }
     } else if (line[0]) {
         ESP_LOGW(TAG, "unknown: %s", line);
     }

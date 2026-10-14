@@ -20,7 +20,8 @@ Works on hardware:
   arrives, up to about 20 fps at 1280x720; over Wi-Fi the device usually
   sends 10 to 20.
 - The menu and the notes over the picture, without flicker.
-- Zoom (shown with a test command; the pinch itself is not tried yet).
+- Touch input to the target, the trackpad mode, two-finger scroll, and
+  zoom with a pinch.
 - The bar of extra keys, with Ctrl, Alt, Win and Shift held for the next key.
 - Finding ESP-KVM devices on the network by mDNS (other HTTPS devices, such
   as routers, are left out).
@@ -28,23 +29,13 @@ Works on hardware:
 - Sleep: the screen goes dark and no picture is sent; a touch wakes it.
 - Asking GitHub for the latest release of itself.
 - Turning the screen over when the Tab5 is held upside down.
-
-Built but not tried yet:
-
-- Touch input to the target, the trackpad mode, two-finger scroll and pinch.
-- Several saved Wi-Fi networks (up to five): the strongest one in range is
-  joined, a saved one connects with a tap, FORGET drops it. Joining the one
-  saved before works.
-- Installing an update (there is no release yet), and going back after a bad one.
 - Screen brightness from the menu and the TERMINAL screen.
-- A USB keyboard and mouse in the Tab5's USB-A port.
-- The battery level and switching off (my Tab5 has no battery in it).
-- Sign-in with a 2FA code.
-- The device list (switching, forgetting).
-- Text mode (the target's screen read as characters).
+- The battery level and switching off.
 - The target's power, hard off, reset and Wake-on-LAN buttons, and
   Ctrl+Alt+Del.
-- Tailscale.
+- A USB keyboard and mouse in the Tab5's USB-A port.
+- Tailscale: a device reached by its tailnet address, about 11 to 14 fps at
+  720p on my network.
 
 The device's video codec must be set to MJPEG. The P4 has no
 H.264 decoder, and software decoding manages about 4 fps at 720p.
@@ -83,7 +74,8 @@ A release is made by pushing a tag (`v0.2.0`) with its section in
 `.github/workflows/build.yml` builds it and attaches:
 
 - `espkvm-term.bin`: the app, for updates and for M5 Launcher;
-- `espkvm-term-merged.bin`: everything at 0x0, for a Tab5 that never ran it;
+- `espkvm-term-merged.bin`: everything at 0x0, for a Tab5 that never ran it
+  (it replaces M5 Launcher, if one is there);
 - `sha256sums.txt`.
 
 ## Build
@@ -156,7 +148,7 @@ seconds, to measure the frame rate on a still screen).
 
 ## License
 
-Apache-2.0, see `LICENSE`.
+Apache-2.0, see `LICENSE`. Copyright 2026 Evgenij Spitsyn, see `NOTICE`.
 
 Third-party parts:
 

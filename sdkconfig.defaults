@@ -10,6 +10,9 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_HEX=y
 CONFIG_SPIRAM_SPEED_200M=y
+# malloc() up to this size tries internal RAM first. At 16 KB (the default) the
+# start of video took internal RAM down to 1.4 KB free; at 4 KB it stays ~34 KB.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 
 CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
@@ -24,6 +27,9 @@ CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
 CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
 CONFIG_ESP32P4_TAB5_C6_BOARD=y
 CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n
+# SDIO RX buffers grow on demand; from internal RAM the alloc fails once
+# video runs, the read is skipped and Wi-Fi receive stalls for good
+CONFIG_EH_HOST_PORT_DMA_PREFER_SPIRAM=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # LVGL allocates from the system heap (PSRAM for big buffers), not a 64 KB pool.
@@ -66,3 +72,15 @@ CONFIG_LWIP_L2_TO_L3_COPY=y
 
 # An update that never gets onto the network is rolled back at the next boot
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Tailscale: every tunnelled packet lands on one UDP socket. A 64 KB TCP
+# window arrives as ~45 datagrams in a burst; the default mailbox of 6
+# dropped most of them and video crawled at ~50 KB/s.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+
+# A send (mouse, ping, frame ack) otherwise waits for the client task to
+# finish reading, and missed its 200 ms most of the time while video flowed.
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+# The receive pool must cover a TCP window (64 KB = 45 packets): with 20 it
+# ran dry while video flowed, dropped packets and TCP stalled for ~1.5 s.
+CONFIG_ESP_HOSTED_HOST_SDIO_RX_Q_SIZE=48

@@ -8,6 +8,7 @@
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
@@ -88,8 +89,12 @@ static void set_level(int level)
     if (level == 2) {
         bsp_display_backlight_off();
         link_video(false);
+        /* Nothing to show: modem sleep again, it saves the battery. Awake,
+         * net.c keeps it off for the round trips. */
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     } else {
         if (s_level == 2) {
+            esp_wifi_set_ps(WIFI_PS_NONE);
             link_video(true);
             link_request_keyframe();
         }

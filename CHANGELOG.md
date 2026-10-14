@@ -4,10 +4,9 @@ All notable changes to espkvm-term are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/). While it is pre-1.0, a new
 feature bumps the minor and a fix bumps the patch.
 
-## [0.1.0] - 2026-10-13
+## [0.1.0] - 2026-10-14
 
-The first release. What is tried on hardware and what is only built is
-listed in the README.
+The first release. What is tried on hardware is listed in the README.
 
 ### Added
 - Wi-Fi through the Tab5's ESP32-C6. Up to five networks are saved and the
@@ -23,3 +22,7 @@ listed in the README.
 - Updates from GitHub releases, with a way back after a bad one.
 - Reconnecting by itself when the device or the network drops, including a
   link lost in the middle of a frame.
+- Tailscale: a device reached by its tailnet address.
+- Frame acks with ESP-KVM 0.65.0 or newer: the device sends only as many
+  frames as the link carries, so a slow link shows the newest frame. Older
+  firmware works too, more slowly over a slow link.

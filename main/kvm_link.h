@@ -70,6 +70,10 @@ void link_connect(const link_cfg_t *cfg, const char *code);
 /* Answer to LINK_TRUST. */
 void link_trust(bool yes);
 void link_disconnect(void);
+/* Debug: frame acks on/off (takes effect on the next /video socket). */
+void link_set_acks(bool on);
+/* Debug: the pinned CA of the current device, or NULL. */
+const char *link_ca(void);
 /* Both sockets up right now. */
 bool link_online(void);
 /* Sends one /ws message (binary). False if not online. */

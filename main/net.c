@@ -12,6 +12,7 @@
 #include "esp_hosted.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_system.h"
 #include "mdns.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -47,6 +48,7 @@ static int s_retries;
 /* A scan asked for while joining is refused or silently dropped, so until one
  * has come back it is run again once the join settles. */
 static bool s_scan_pending, s_scanned;
+static volatile bool s_have_ip;
 
 static void state(net_state_t st, const char *info)
 {
@@ -261,6 +263,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         scan_done();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = data;
+        s_have_ip = false;
         if (!s_ssid[0]) {
             return;
         }
@@ -298,12 +301,38 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             s_unsaved = false;
         }
         s_retries = 0;
+        s_have_ip = true;
         char ip[16];
         snprintf(ip, sizeof(ip), IPSTR, IP2STR(&e->ip_info.ip));
         ESP_LOGI(TAG, "%s: %s", s_ssid, ip);
         state(NET_CONNECTED, ip);
         if (s_scan_pending || !s_scanned) {
             net_scan();
+        }
+    }
+}
+
+/* The C6 can stop answering requests: the P4 then retries a join that
+ * never reaches the radio. Only a restart brings it back (the C6 is reset
+ * at boot), so do that when it fails to answer twice while offline. */
+static void c6_watch_task(void *arg)
+{
+    int misses = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        if (s_have_ip) {
+            misses = 0;
+            continue;
+        }
+        esp_hosted_coprocessor_fwver_t ver;
+        if (esp_hosted_get_coprocessor_fwversion(&ver) == ESP_OK) {
+            misses = 0;
+        } else if (++misses >= 2) {
+            ESP_LOGE(TAG, "C6 not answering: restarting");
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        } else {
+            ESP_LOGW(TAG, "C6 did not answer");
         }
     }
 }
@@ -337,6 +366,11 @@ static void net_task(void *arg)
         esp_wifi_set_mode(WIFI_MODE_STA);
         err = esp_wifi_start();
     }
+    if (err == ESP_OK) {
+        /* Modem sleep (the default) lets the access point hold our packets
+         * until the next beacon: 300-600 ms round trips on the same Wi-Fi. */
+        esp_wifi_set_ps(WIFI_PS_NONE);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi start: %s", esp_err_to_name(err));
         state(NET_OFF, "Wi-Fi did not start");
@@ -361,6 +395,7 @@ static void net_task(void *arg)
 
     const esp_timer_create_args_t ta = {.callback = rescan, .name = "rescan"};
     esp_timer_create(&ta, &s_rescan);
+    xTaskCreate(c6_watch_task, "c6watch", 4096, NULL, 2, NULL);
     if (s_n_saved) {
         state(NET_CONNECTING, "looking for a saved network");
         s_pick = true;
