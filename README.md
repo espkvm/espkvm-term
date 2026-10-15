@@ -6,6 +6,8 @@ control the target. No browser or computer is needed.
 
 ![The terminal on an M5Stack Tab5 with its keyboard, showing a target's desktop](docs/terminal.jpg)
 
+[A 26-second video of it running](https://youtu.be/fkVMvvYvx0U)
+
 ## Status
 
 Early. It runs on my Tab5 against my own ESP-KVM devices.
