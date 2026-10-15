@@ -1,8 +1,11 @@
 # ESP-KVM terminal
 
 Firmware for the M5Stack Tab5 that shows an [ESP-KVM](https://github.com/espkvm/espkvm)
-device's screen on the Tab5's display. The Tab5's touch screen and keyboard
-control the target. No browser or computer is needed.
+device's picture on the Tab5's own screen, and controls the target with its
+touch screen and keyboard, no browser needed. It is not the KVM itself: the
+KVM stays plugged into the target, and the Tab5 connects to it over the
+network like any other viewer. The Tab5 has the same ESP32-P4 as the KVM, so
+I tried it.
 
 ![The terminal on an M5Stack Tab5 with its keyboard, showing a target's desktop](docs/terminal.jpg)
 
@@ -10,7 +13,9 @@ control the target. No browser or computer is needed.
 
 ## Status
 
-Early. It runs on my Tab5 against my own ESP-KVM devices.
+Experimental. It runs on my Tab5 against my own ESP-KVM devices, and I do
+not know yet whether anyone else needs it. If you try it, or decide you
+would not, [vote and say why](https://github.com/orgs/espkvm/discussions/75).
 
 Works on hardware:
 
@@ -18,10 +23,9 @@ Works on hardware:
   password. The Tab5 remembers it.
 - Sign-in with user and password. On the first visit the device's CA is
   shown with its SHA-256 fingerprint and trusted only after you accept it.
-- The picture: MJPEG from the device. The Tab5 draws everything that
-  arrives, up to about 20 fps at 1280x720; over Wi-Fi the device usually
-  sends 10 to 20.
-- The menu and the notes over the picture, without flicker.
+- The picture: MJPEG from the device, up to about 20 fps at 1280x720.
+  Over Wi-Fi the device usually sends 10 to 20, and with ESP-KVM 0.65.0 or
+  newer the Tab5 acks each frame, so a slow link shows the newest one.
 - Touch input to the target, the trackpad mode, two-finger scroll, and
   zoom with a pinch.
 - The bar of extra keys, with Ctrl, Alt, Win and Shift held for the next key.
@@ -29,7 +33,7 @@ Works on hardware:
   as routers, are left out).
 - Reconnecting after the device or the network drops.
 - Sleep: the screen goes dark and no picture is sent; a touch wakes it.
-- Asking GitHub for the latest release of itself.
+- Checking GitHub for a new release of itself.
 - Turning the screen over when the Tab5 is held upside down.
 - Screen brightness from the menu and the TERMINAL screen.
 - The battery level and switching off.
@@ -135,11 +139,17 @@ Commands over the USB serial port, for development (the port is
 - `tools/shot.py chr TEXT` types text.
 - `tools/shot.py key N` sends one key.
 
-Typed on the port: `heap` (free memory), `stats` (frame rates, decode
-time, zoom), `link` (the sockets), `power` (battery and tilt), `zoom Z X Y`,
-`tcp IP PORT` (opens a plain TCP connection, to tell a network fault from
-a device fault), and `wiggle` (moves the target's pointer round a small circle for ten
-seconds, to measure the frame rate on a still screen).
+Typed on the port:
+
+- `heap`, `stats` (frame rates, decode time, zoom), `link` (sockets, ping,
+  late frames), `power` (battery and tilt), `rssi`, `zoom Z X Y`.
+- `wiggle` moves the target's pointer round a small circle for ten seconds,
+  so a still screen sends frames and the frame rate can be measured.
+- `tcp IP PORT` opens a plain TCP connection: it tells a network fault from
+  a device fault. `dl URL` measures a download.
+- `host ADDR` signs in to another address with the saved user, `trust`
+  accepts the shown certificate, `acks 0|1` turns frame acks off or on.
+- `sleep`, and `log TAG LEVEL` to change a log level.
 
 ## Security notes
 
